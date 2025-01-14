@@ -4,14 +4,14 @@
 resolution = true
 skip-lint = false
 
-[programs.localnet]
-estate_protocol = "FnYCJduVWVoSzg55RNG1y9up4ow7uHvJXmeGEjyZeyFb"
+[programs.devnet]
+estate_protocol = "4WstPcHhmJed9upcqrZ9LpUSXBgx6qL4jP28pPdtCvie"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
+cluster = "devnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
