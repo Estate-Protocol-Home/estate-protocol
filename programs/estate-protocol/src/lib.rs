@@ -2,11 +2,17 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{Token, Mint, TokenAccount};
 use mpl_token_metadata::instruction::{create_metadata_accounts_v3};
 use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::token::{self, Transfer};
+use anchor_lang::solana_program::native_token::LAMPORTS_PER_SOL;
+use pyth_sdk_solana::load_price_feed_from_account_info;
+
 
 declare_id!("4WstPcHhmJed9upcqrZ9LpUSXBgx6qL4jP28pPdtCvie");
 
 pub const ACCREDITED_LOCK_PERIOD: i64 = 365 * 24 * 60 * 60;    // 1 year in seconds
 pub const NON_ACCREDITED_LOCK_PERIOD: i64 = 0; 
+pub const PRECISION: u64 = 1_000_000;  // 6 decimals for USDC
+pub const LAMPORTS_TO_SOL: u128 = LAMPORTS_PER_SOL as u128;
 
 #[program]
 pub mod estate_protocol {
@@ -112,12 +118,13 @@ pub mod estate_protocol {
 
     // Tier validation
     require!(
-        !params.tiers.is_empty() && params.tiers.len() <= STOConfig::MAX_TIERS,
+        params.num_tiers > 0 && params.num_tiers <= STOConfig::MAX_TIERS as u8,
         ErrorCode::InvalidTierConfiguration
     );
     
     let mut total_allocation = 0u64;
-    for tier_params in params.tiers.iter() {
+    for i in 0..params.num_tiers as usize {
+        let tier_params = &params.tiers[i];
         // Validate tier parameters
         require!(tier_params.rate > 0, ErrorCode::InvalidPrice);
         require!(
@@ -159,23 +166,32 @@ pub mod estate_protocol {
     sto_config.investor_count = 0;
     sto_config.whitelist_required = params.whitelist_required;
     sto_config.current_tier = 0;
-    sto_config.max_tiers = params.tiers.len() as u8;
-    sto_config.bump = *ctx.bumps.get("sto_config").unwrap();
+    sto_config.max_tiers = params.num_tiers;
 
-    // Initialize tiers
-    for (i, tier_params) in params.tiers.iter().enumerate() {
-        let tier = Tier {
-            rate: tier_params.rate,
-            rate_discounted: tier_params.rate_discounted,
-            total_tokens: tier_params.total_tokens,
+    // Initialize payment config
+    sto_config.payment_mints = params.payment_mints;
+    sto_config.payment_enabled = params.payment_enabled;
+    sto_config.funds_raised = [0; 3];
+
+    
+    // Initialize tiers with default values first
+    sto_config.tiers = [Tier::default(); STOConfig::MAX_TIERS];
+    
+    // Then fill in the actual tiers
+    for i in 0..params.num_tiers as usize {
+        sto_config.tiers[i] = Tier {
+            rate: params.tiers[i].rate,
+            rate_discounted: params.tiers[i].rate_discounted,
+            total_tokens: params.tiers[i].total_tokens,
             tokens_sold: 0,
-            tokens_discounted: tier_params.tokens_discounted,
-            min_investment: tier_params.min_investment,
-            max_investment: tier_params.max_investment,
+            tokens_discounted: params.tiers[i].tokens_discounted,
+            min_investment: params.tiers[i].min_investment,
+            max_investment: params.tiers[i].max_investment,
         };
-        sto_config.tiers.push(tier);
     }
     
+    sto_config.bump = *ctx.bumps.get("sto_config").unwrap();
+
     // Mint total allocation to Treasury PDA
     anchor_spl::token::mint_to(
         CpiContext::new_with_signer(
@@ -194,7 +210,7 @@ pub mod estate_protocol {
         total_allocation,
     )?;
 
-    msg!("STO created with {} tiers", params.tiers.len());
+    msg!("STO created with {} tiers", params.num_tiers);
     Ok(())
 }
 
@@ -240,157 +256,184 @@ pub fn complete_sto(ctx: Context<ManageSTO>) -> Result<()> {
     });
     Ok(())
 }
-// pub fn invest(ctx: Context<Invest>, amount: u64) -> Result<()> {
-//     let sto_config = &mut ctx.accounts.sto_config;
+
+
+pub fn invest(ctx: Context<Invest>, amount: u64, is_using_discount: bool) -> Result<()> {
+    let tier_idx = ctx.accounts.sto_config.current_tier as usize;
     
-//     // Status checks
-//     require!(
-//         sto_config.status == STOStatus::Active, 
-//         ErrorCode::STONotActive
-//     );
+    require!(ctx.accounts.sto_config.status == STOStatus::Active, ErrorCode::STONotActive);
     
-//     // Time check
-//     let clock = Clock::get()?;
-//     require!(
-//         clock.unix_timestamp >= sto_config.start_time && 
-//         clock.unix_timestamp <= sto_config.end_time,
-//         ErrorCode::OutsideSTOTime
-//     );
-
-//     // Get current tier
-//     let current_tier_idx = sto_config.current_tier as usize;
-//     require!(
-//         current_tier_idx < sto_config.tiers.len(),
-//         ErrorCode::InvalidTier
-//     );
-
-//     let tier = &mut sto_config.tiers[current_tier_idx];
+    let clock = Clock::get()?;
+    require!(
+        clock.unix_timestamp >= ctx.accounts.sto_config.start_time &&
+        clock.unix_timestamp <= ctx.accounts.sto_config.end_time,
+        ErrorCode::OutsideSTOTime
+    );
+ 
+    let current_tier = &ctx.accounts.sto_config.tiers[tier_idx];
     
-//     // Amount checks
-//     require!(
-//         amount >= tier.min_investment,
-//         ErrorCode::BelowMinimumPurchase
-//     );
-//     require!(
-//         amount <= tier.max_investment,
-//         ErrorCode::ExceedsMaxInvestment
-//     );
+    require!(amount >= current_tier.min_investment, ErrorCode::BelowMinimumPurchase);
+    require!(amount <= current_tier.max_investment, ErrorCode::ExceedsMaxInvestment);
+    
+    let tier_rate = if is_using_discount {
+        require!(current_tier.tokens_discounted > 0, ErrorCode::InsufficientDiscountTokens);
+        current_tier.rate_discounted
+    } else {
+        current_tier.rate  
+    };
+ 
+    let tokens_to_transfer = amount
+        .checked_mul(PRECISION)
+        .ok_or(ErrorCode::CalculationError)?
+        .checked_div(tier_rate)
+        .ok_or(ErrorCode::CalculationError)?;
+ 
+    require!(
+        tokens_to_transfer <= current_tier.total_tokens.saturating_sub(current_tier.tokens_sold),
+        ErrorCode::ExceedsAllocation
+    );
+ 
+    token::transfer(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.investor_usdc_account.to_account_info(),
+                to: ctx.accounts.treasury_usdc_account.to_account_info(),
+                authority: ctx.accounts.investor.to_account_info(),
+            },
+        ),
+        amount,
+    )?;
+ 
+    token::transfer(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.sto_treasury.to_account_info(),
+                to: ctx.accounts.investor_token_account.to_account_info(), 
+                authority: ctx.accounts.sto_config.to_account_info(),
+            },
+            &[&[
+                b"sto_config",
+                ctx.accounts.token_mint.key().as_ref(),
+                &[ctx.accounts.sto_config.bump],
+            ]],
+        ),
+        tokens_to_transfer,
+    )?;
+ 
+    update_sto_state(
+        &mut ctx.accounts.sto_config,
+        tier_idx,
+        tokens_to_transfer, 
+        amount,
+        is_using_discount
+    )?;
+ 
+    emit!(InvestmentMade {
+        investor: ctx.accounts.investor.key(),
+        amount,
+        tokens_purchased: tokens_to_transfer
+    });
+ 
+    Ok(())
+ }
 
-//     // Validate discount eligibility if using discount
-//     if ctx.accounts.is_using_discount {
-//         require!(
-//             ctx.accounts.investor_discount.is_eligible,
-//             ErrorCode::NotEligibleForDiscount
-//         );
-//     }
+ pub fn invest_with_sol(ctx: Context<InvestWithSol>, amount: u64) -> Result<()> {
+    require!(
+        ctx.accounts.sto_config.payment_enabled[0], 
+        ErrorCode::PaymentNotEnabled
+    );
 
-//     // Calculate tokens based on tier rate
-//     let tokens_to_purchase = if ctx.accounts.is_using_discount {
-//         require!(
-//             tier.tokens_discounted.checked_sub(tier.tokens_sold).unwrap() >= amount,
-//             ErrorCode::InsufficientDiscountTokens
-//         );
-//         amount
-//             .checked_mul(tier.rate_discounted)
-//             .ok_or(ErrorCode::CalculationError)?
-//     } else {
-//         amount
-//             .checked_mul(tier.rate)
-//             .ok_or(ErrorCode::CalculationError)?
-//     };
+    let tier_idx = ctx.accounts.sto_config.current_tier as usize;
+    
+    require!(ctx.accounts.sto_config.status == STOStatus::Active, ErrorCode::STONotActive);
+    
+    let clock = Clock::get()?;
+    require!(
+        clock.unix_timestamp >= ctx.accounts.sto_config.start_time &&
+        clock.unix_timestamp <= ctx.accounts.sto_config.end_time,
+        ErrorCode::OutsideSTOTime
+    );
 
-//     // Check tier capacity
-//     require!(
-//         tier.total_tokens.checked_sub(tier.tokens_sold).unwrap() >= tokens_to_purchase,
-//         ErrorCode::TierFull
-//     );
+    // Get SOL/USD price from Pyth
+    let price_feed = pyth_sdk_solana::load_price_feed_from_account_info(&ctx.accounts.sol_price_feed)
+        .map_err(|_| ErrorCode::InvalidPriceFeed)?;
+    let price = price_feed.get_price_unchecked();
+    
+    // Convert SOL amount to USD value using PRECISION
+    let amount_usd = (amount as u128)
+        .checked_mul(price.price as u128)
+        .ok_or(ErrorCode::CalculationError)?
+        .checked_div(LAMPORTS_TO_SOL as u128)
+        .ok_or(ErrorCode::CalculationError)? as u64;
 
-//     // Transfer USDC from investor
-//     anchor_spl::token::transfer(
-//         CpiContext::new(
-//             ctx.accounts.token_program.to_account_info(),
-//             anchor_spl::token::Transfer {
-//                 from: ctx.accounts.investor_usdc_account.to_account_info(),
-//                 to: ctx.accounts.treasury_usdc_account.to_account_info(),
-//                 authority: ctx.accounts.investor.to_account_info(),
-//             },
-//         ),
-//         amount,
-//     )?;
+    let current_tier = &ctx.accounts.sto_config.tiers[tier_idx];
+    
+    require!(amount_usd >= current_tier.min_investment, ErrorCode::BelowMinimumPurchase);
+    require!(amount_usd <= current_tier.max_investment, ErrorCode::ExceedsMaxInvestment);
+    
+    let tokens_to_transfer = amount_usd
+        .checked_mul(PRECISION)
+        .ok_or(ErrorCode::CalculationError)?
+        .checked_div(current_tier.rate)
+        .ok_or(ErrorCode::CalculationError)?;
 
-//     // Transfer tokens to investor
-//     anchor_spl::token::transfer(
-//         CpiContext::new_with_signer(
-//             ctx.accounts.token_program.to_account_info(),
-//             anchor_spl::token::Transfer {
-//                 from: ctx.accounts.sto_treasury.to_account_info(),
-//                 to: ctx.accounts.investor_token_account.to_account_info(),
-//                 authority: ctx.accounts.sto_config.to_account_info(),
-//             },
-//             &[&[
-//                 b"sto_config",
-//                 ctx.accounts.token_mint.key().as_ref(),
-//                 &[ctx.accounts.sto_config.bump],
-//             ]],
-//         ),
-//         tokens_to_purchase,
-//     )?;
+    require!(
+        tokens_to_transfer <= current_tier.total_tokens.saturating_sub(current_tier.tokens_sold),
+        ErrorCode::ExceedsAllocation
+    );
 
-//     // Update tier state
-//     tier.tokens_sold = tier.tokens_sold.checked_add(tokens_to_purchase).unwrap();
-//     if ctx.accounts.is_using_discount {
-//         tier.tokens_discounted = tier.tokens_discounted.checked_sub(tokens_to_purchase).unwrap();
-//     }
+    // Transfer SOL to vault
+    system_program::transfer(
+        CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            system_program::Transfer {
+                from: ctx.accounts.investor.to_account_info(),
+                to: ctx.accounts.sol_vault.to_account_info(),
+            },
+        ),
+        amount,
+    )?;
 
-//     // Check if tier is full and advance if needed
-//     if tier.tokens_sold >= tier.total_tokens {
-//         sto_config.current_tier = sto_config.current_tier.checked_add(1).unwrap();
-//     }
+    // Transfer security tokens to investor
+    token::transfer(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.sto_treasury.to_account_info(),
+                to: ctx.accounts.investor_token_account.to_account_info(),
+                authority: ctx.accounts.sto_config.to_account_info(),
+            },
+            &[&[
+                b"sto_config",
+                ctx.accounts.token_mint.key().as_ref(),
+                &[ctx.accounts.sto_config.bump],
+            ]],
+        ),
+        tokens_to_transfer,
+    )?;
 
-//     // Update overall STO state
-//     sto_config.total_sold = sto_config.total_sold.checked_add(tokens_to_purchase).unwrap();
-//     sto_config.total_funds_raised = sto_config.total_funds_raised.checked_add(amount).unwrap();
-//     sto_config.investor_count = sto_config.investor_count.checked_add(1).unwrap();
+    // Update state
+    let sto_config = &mut ctx.accounts.sto_config;
+    sto_config.funds_raised[0] = sto_config.funds_raised[0].checked_add(amount).unwrap();
+    
+    update_sto_state(
+        sto_config,
+        tier_idx,
+        tokens_to_transfer,
+        amount_usd,
+        false
+    )?;
 
-//     // Initialize lock status for the investor
-//     let lock_status = &mut ctx.accounts.lock_status;
-//     lock_status.investor = ctx.accounts.investor.key();
-//     lock_status.token_mint = ctx.accounts.token_mint.key();
-//     lock_status.unlock_time = clock.unix_timestamp + NON_ACCREDITED_LOCK_PERIOD;
-//     lock_status.is_accredited = false;
-//     lock_status.bump = *ctx.bumps.get("lock_status").unwrap();
+    emit!(InvestmentMade {
+        investor: ctx.accounts.investor.key(),
+        amount: amount_usd,
+        tokens_purchased: tokens_to_transfer 
+    });
 
-//     // Freeze the tokens
-//     anchor_spl::token::freeze_account(
-//         CpiContext::new_with_signer(
-//             ctx.accounts.token_program.to_account_info(),
-//             anchor_spl::token::FreezeAccount {
-//                 account: ctx.accounts.investor_token_account.to_account_info(),
-//                 mint: ctx.accounts.token_mint.to_account_info(),
-//                 authority: ctx.accounts.token_config.to_account_info(),
-//             },
-//             &[&[
-//                 b"token_config",
-//                 ctx.accounts.token_mint.key().as_ref(),
-//                 &[ctx.accounts.token_config.bump],
-//             ]],
-//         )
-//     )?;
-
-//     emit!(TokensFrozen {
-//         investor: ctx.accounts.investor.key(),
-//         unlock_time: lock_status.unlock_time,
-//         is_accredited: lock_status.is_accredited,
-//     });
-
-//     emit!(InvestmentMade {
-//         investor: ctx.accounts.investor.key(),
-//         amount,
-//         tokens_purchased: tokens_to_purchase,
-//     });
-
-//     Ok(())
-// }
+    Ok(())
+}
 
 pub fn unfreeze_investor_tokens(ctx: Context<UnfreezeTokens>) -> Result<()> {
     let lock_status = &ctx.accounts.lock_status;
@@ -436,6 +479,35 @@ pub fn unfreeze_investor_tokens(ctx: Context<UnfreezeTokens>) -> Result<()> {
 }
    
 }
+
+
+
+fn update_sto_state(
+    sto_config: &mut Account<STOConfig>,
+    current_tier_idx: usize,
+    tokens_purchased: u64,
+    amount: u64,
+    is_using_discount: bool,
+) -> Result<()> {
+    let tier = &mut sto_config.tiers[current_tier_idx];
+    
+    tier.tokens_sold = tier.tokens_sold.checked_add(tokens_purchased).unwrap();
+    if is_using_discount {
+        tier.tokens_discounted = tier.tokens_discounted.checked_sub(tokens_purchased).unwrap();
+    }
+
+    if tier.tokens_sold >= tier.total_tokens {
+        sto_config.current_tier = sto_config.current_tier.checked_add(1).unwrap();
+    }
+
+    sto_config.total_sold = sto_config.total_sold.checked_add(tokens_purchased).unwrap();
+    sto_config.total_funds_raised = sto_config.total_funds_raised.checked_add(amount).unwrap();
+    sto_config.investor_count = sto_config.investor_count.checked_add(1).unwrap();
+    
+    Ok(())
+}
+
+
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
@@ -550,8 +622,45 @@ pub struct ManageSTO<'info> {
     pub token_mint: Account<'info, Mint>,
 }
 
+#[derive(Accounts)]
+#[instruction(amount: u64, is_using_discount: bool)]
+pub struct Invest<'info> {
+    #[account(mut)]
+    pub investor: Signer<'info>,
+    
+    #[account(mut)]
+    pub sto_config: Box<Account<'info, STOConfig>>, // Box the large account
 
+    #[account(mut)]
+    pub token_config: Account<'info, TokenConfig>,
 
+    #[account(
+        mut,
+        constraint = investor_usdc_account.owner == investor.key()
+    )]
+    pub investor_usdc_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub treasury_usdc_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = sto_treasury.mint == token_mint.key()
+    )]
+    pub sto_treasury: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = investor_token_account.owner == investor.key(),
+        constraint = investor_token_account.mint == token_mint.key()
+    )]
+    pub investor_token_account: Account<'info, TokenAccount>,
+
+    pub token_mint: Account<'info, Mint>,
+    pub usdc_mint: Account<'info, Mint>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
 
 #[derive(Accounts)]
 pub struct FreezeTokens<'info> {
@@ -617,7 +726,49 @@ pub struct UnfreezeTokens<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[derive(Accounts)]
+pub struct InvestWithSol<'info> {
+   #[account(mut)]
+   pub investor: Signer<'info>,
+   
+   #[account(mut)]
+   pub sto_config: Box<Account<'info, STOConfig>>,
+
+   #[account(mut)]
+   pub token_config: Account<'info, TokenConfig>,
+
+   #[account(
+       mut,
+       seeds = [b"sol_vault", sto_config.key().as_ref()],
+       bump
+   )]
+   /// CHECK: SOL vault PDA
+   pub sol_vault: AccountInfo<'info>,
+
+   #[account(
+       mut,
+       constraint = sto_treasury.mint == token_mint.key()
+   )]
+   pub sto_treasury: Account<'info, TokenAccount>,
+
+   #[account(
+       mut,
+       constraint = investor_token_account.owner == investor.key(),
+       constraint = investor_token_account.mint == token_mint.key()
+   )]
+   pub investor_token_account: Account<'info, TokenAccount>,
+
+   pub token_mint: Account<'info, Mint>,
+
+   /// CHECK: Pyth price feed
+   pub sol_price_feed: AccountInfo<'info>,
+   
+   pub token_program: Program<'info, Token>,
+   pub system_program: Program<'info, System>,
+}
+
 #[account]
+#[derive(Copy)] 
 pub struct Tier {
     pub rate: u64,                // Price in USDC
     pub rate_discounted: u64,     // Discounted price (optional)
@@ -628,19 +779,24 @@ pub struct Tier {
     pub max_investment: u64,      // Max investment
 }
 
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq)]
+pub enum FundRaiseType {
+    SOL,
+    USDC,
+    USDT
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct STOParameters {
     pub treasury_wallet: Pubkey,
-    pub tiers: Vec<TierParams>,
-    pub price_per_token: u64,
-    pub total_allocation: u64,
-    pub min_purchase: u64,
-    pub max_non_accredited: u64,
+    pub payment_mints: [Pubkey; 2], // [USDC, USDT]
+    pub payment_enabled: [bool; 3], // [SOL, USDC, USDT]
+    pub tiers: [TierParams; 1], 
+    pub num_tiers: u8,
     pub start_time: i64,
     pub end_time: i64,
     pub whitelist_required: bool,
 }
-
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct TierParams {
     pub rate: u64,
@@ -680,12 +836,16 @@ pub struct STOConfig {
     pub start_time: i64,         
     pub end_time: i64,           
     pub status: STOStatus,       
-    pub whitelist_required: bool,     
+    pub whitelist_required: bool,   
+    pub payment_mints: [Pubkey; 2],  // [USDC, USDT]
+    pub payment_enabled: [bool; 3],   // [SOL, USDC, USDT] 
+    pub funds_raised: [u64; 3],      // Amount raised per payment type  
     pub current_tier: u8,         
     pub max_tiers: u8,           
-    pub tiers: Vec<Tier>,        
+    pub tiers: [Tier; 1],
     pub bump: u8,                
 }
+
 
 
 #[account]
@@ -790,6 +950,10 @@ pub enum ErrorCode {
     ExceedsMaxInvestment,
     #[msg("Invalid investment limits configuration")]
     InvalidInvestmentLimits,
+    #[msg("Payment type not enabled")]
+   PaymentNotEnabled,
+    #[msg("Invalid price feed")]
+   InvalidPriceFeed,
 }
 
 #[event]
@@ -834,26 +998,28 @@ impl TokenConfig {
 
 
 impl STOConfig {
-    pub const MAX_TIERS: usize = 5;  // Maximum 5 tiers
+    pub const MAX_TIERS: usize = 1;
     
     pub const LEN: usize = 8 +    // Discriminator
-        32 +                      // authority
-        32 +                      // token_mint
-        32 +                      // usdc_mint
-        32 +                      // treasury_wallet
-        8 +                       // total_allocation
-        8 +                       // total_sold
-        8 +                       // total_funds_raised
-        4 +                       // investor_count
-        8 +                       // start_time
-        8 +                       // end_time
-        1 +                       // status
-        1 +                       // whitelist_required
-        1 +                       // current_tier
-        1 +                       // max_tiers
-        4 +                       // Vec length
-        (Tier::LEN * Self::MAX_TIERS) + // Space for tiers
-        1;                        // bump
+        32 +                      // authority: Pubkey
+        32 +                      // token_mint: Pubkey  
+        32 +                      // usdc_mint: Pubkey
+        32 +                      // treasury_wallet: Pubkey
+        (32 * 2) +               // payment_mints array
+        3 +                      // payment_enabled array 
+        (8 * 3) +                // funds_raised array
+        8 +                       // total_allocation: u64
+        8 +                       // total_sold: u64
+        8 +                       // total_funds_raised: u64
+        4 +                       // investor_count: u32
+        8 +                       // start_time: i64
+        8 +                       // end_time: i64
+        1 +                       // status: STOStatus
+        1 +                       // whitelist_required: bool
+        1 +                       // current_tier: u8
+        1 +                       // max_tiers: u8
+        (8 * 7) +                // tiers: [Tier; MAX_TIERS] (7 u64 fields * 8 bytes)
+        1;                       // bump: u8
 }
 
 impl InvestorLockStatus {
@@ -866,7 +1032,7 @@ impl InvestorLockStatus {
 }
 
 impl Tier {
-    pub const LEN: usize = 8 +    // Discriminator
+    pub const LEN: usize = 8 +
         8 +                       // rate
         8 +                       // rate_discounted
         8 +                       // total_tokens
@@ -876,3 +1042,16 @@ impl Tier {
         8;                        // max_investment
 }
 
+impl Default for Tier {
+    fn default() -> Self {
+        Self {
+            rate: 0,
+            rate_discounted: 0,
+            total_tokens: 0,
+            tokens_sold: 0,
+            tokens_discounted: 0,
+            min_investment: 0,
+            max_investment: 0,
+        }
+    }
+}

@@ -16,7 +16,9 @@ no-idl = []
 no-log-ix-name = []
 
 [dependencies]
-anchor-lang = "0.28.0"
+anchor-lang = { version = "0.28.0", features = ["init-if-needed", "derive"] }
 anchor-spl = "0.28.0"
 ahash = "=0.8.6"
 mpl-token-metadata = { version = "1.13", features = ["no-entrypoint"], default-features = false }
+pyth-sdk-solana = "0.7.1"
+solana-program = "=1.16.18"
