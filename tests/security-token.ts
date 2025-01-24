@@ -36,7 +36,7 @@ describe("estate_protocol", () => {
     const tokenDetails = "https://example.com/token";
     const divisible = true;
     const treasuryWallet = provider.wallet.publicKey;
-    const documentHash = "QmHash..."; // Example IPFS hash
+    const documentHash = "QmHash...";
 
     try {
       await program.methods
@@ -69,7 +69,7 @@ describe("estate_protocol", () => {
       expect(tokenConfigAccount.mint).to.eql(mint.publicKey);
       expect(tokenConfigAccount.name).to.eq(tokenName);
       expect(tokenConfigAccount.symbol).to.eq(tokenSymbol);
-      expect(tokenConfigAccount.decimals).to.eq(9); // Since divisible is true
+      expect(tokenConfigAccount.decimals).to.eq(9);
       expect(tokenConfigAccount.tokenDetails).to.eq(tokenDetails);
       expect(tokenConfigAccount.documentHash).to.eq(documentHash);
       expect(tokenConfigAccount.treasuryWallet).to.eql(treasuryWallet);
