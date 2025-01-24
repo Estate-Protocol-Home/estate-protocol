@@ -4,6 +4,7 @@ use mpl_token_metadata::instruction::{create_metadata_accounts_v3};
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Transfer};
 use anchor_lang::solana_program::native_token::LAMPORTS_PER_SOL;
+use anchor_lang::system_program;
 use pyth_sdk_solana::load_price_feed_from_account_info;
 
 
@@ -384,11 +385,10 @@ pub fn invest(ctx: Context<Invest>, amount: u64, is_using_discount: bool) -> Res
         ErrorCode::ExceedsAllocation
     );
 
-    // Transfer SOL to vault
-    system_program::transfer(
+    anchor_lang::system_program::transfer(
         CpiContext::new(
             ctx.accounts.system_program.to_account_info(),
-            system_program::Transfer {
+            anchor_lang::system_program::Transfer {
                 from: ctx.accounts.investor.to_account_info(),
                 to: ctx.accounts.sol_vault.to_account_info(),
             },
