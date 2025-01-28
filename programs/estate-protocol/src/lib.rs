@@ -4,7 +4,6 @@ use mpl_token_metadata::instruction::{create_metadata_accounts_v3};
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Transfer};
 use anchor_lang::solana_program::native_token::LAMPORTS_PER_SOL;
-use anchor_lang::system_program;
 use pyth_sdk_solana::load_price_feed_from_account_info;
 
 
@@ -258,8 +257,12 @@ pub fn complete_sto(ctx: Context<ManageSTO>) -> Result<()> {
     Ok(())
 }
 
-
-pub fn invest(ctx: Context<Invest>, amount: u64, is_using_discount: bool) -> Result<()> {
+pub fn invest(
+    ctx: Context<Invest>,
+    amount: u64,
+    is_using_discount: bool,
+    is_accredited: bool
+) -> Result<()> {
     let tier_idx = ctx.accounts.sto_config.current_tier as usize;
     
     require!(ctx.accounts.sto_config.status == STOStatus::Active, ErrorCode::STONotActive);
@@ -322,6 +325,35 @@ pub fn invest(ctx: Context<Invest>, amount: u64, is_using_discount: bool) -> Res
         ),
         tokens_to_transfer,
     )?;
+
+    // Freeze the tokens
+    anchor_spl::token::freeze_account(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            anchor_spl::token::FreezeAccount {
+                account: ctx.accounts.investor_token_account.to_account_info(),
+                mint: ctx.accounts.token_mint.to_account_info(),
+                authority: ctx.accounts.token_config.to_account_info(),
+            },
+            &[&[
+                b"token_config",
+                ctx.accounts.token_mint.key().as_ref(),
+                &[ctx.accounts.token_config.bump],
+            ]],
+        )
+    )?;
+
+    // Initialize lock status
+    let lock_status = &mut ctx.accounts.lock_status;
+    lock_status.investor = ctx.accounts.investor.key();
+    lock_status.token_mint = ctx.accounts.token_mint.key();
+    lock_status.is_accredited = is_accredited;
+    lock_status.unlock_time = if is_accredited {
+        Clock::get()?.unix_timestamp + ACCREDITED_LOCK_PERIOD
+    } else {
+        0 // For non-accredited, we'll check STO completion status instead
+    };
+    lock_status.bump = *ctx.bumps.get("lock_status").unwrap();
  
     update_sto_state(
         &mut ctx.accounts.sto_config,
@@ -336,11 +368,21 @@ pub fn invest(ctx: Context<Invest>, amount: u64, is_using_discount: bool) -> Res
         amount,
         tokens_purchased: tokens_to_transfer
     });
+
+    emit!(TokensFrozen {
+        investor: ctx.accounts.investor.key(),
+        unlock_time: lock_status.unlock_time,
+        is_accredited,
+    });
  
     Ok(())
- }
+}
 
- pub fn invest_with_sol(ctx: Context<InvestWithSol>, amount: u64) -> Result<()> {
+pub fn invest_with_sol(
+    ctx: Context<InvestWithSol>,
+    amount: u64,
+    is_accredited: bool
+) -> Result<()> {
     require!(
         ctx.accounts.sto_config.payment_enabled[0], 
         ErrorCode::PaymentNotEnabled
@@ -358,7 +400,7 @@ pub fn invest(ctx: Context<Invest>, amount: u64, is_using_discount: bool) -> Res
     );
 
     // Get SOL/USD price from Pyth
-    let price_feed = pyth_sdk_solana::load_price_feed_from_account_info(&ctx.accounts.sol_price_feed)
+    let price_feed = load_price_feed_from_account_info(&ctx.accounts.sol_price_feed)
         .map_err(|_| ErrorCode::InvalidPriceFeed)?;
     let price = price_feed.get_price_unchecked();
     
@@ -414,6 +456,35 @@ pub fn invest(ctx: Context<Invest>, amount: u64, is_using_discount: bool) -> Res
         tokens_to_transfer,
     )?;
 
+    // Freeze the tokens
+    anchor_spl::token::freeze_account(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            anchor_spl::token::FreezeAccount {
+                account: ctx.accounts.investor_token_account.to_account_info(),
+                mint: ctx.accounts.token_mint.to_account_info(),
+                authority: ctx.accounts.token_config.to_account_info(),
+            },
+            &[&[
+                b"token_config",
+                ctx.accounts.token_mint.key().as_ref(),
+                &[ctx.accounts.token_config.bump],
+            ]],
+        )
+    )?;
+
+    // Initialize lock status
+    let lock_status = &mut ctx.accounts.lock_status;
+    lock_status.investor = ctx.accounts.investor.key();
+    lock_status.token_mint = ctx.accounts.token_mint.key();
+    lock_status.is_accredited = is_accredited;
+    lock_status.unlock_time = if is_accredited {
+        Clock::get()?.unix_timestamp + ACCREDITED_LOCK_PERIOD
+    } else {
+        0 // For non-accredited, we'll check STO completion status instead
+    };
+    lock_status.bump = *ctx.bumps.get("lock_status").unwrap();
+
     // Update state
     let sto_config = &mut ctx.accounts.sto_config;
     sto_config.funds_raised[0] = sto_config.funds_raised[0].checked_add(amount).unwrap();
@@ -432,8 +503,15 @@ pub fn invest(ctx: Context<Invest>, amount: u64, is_using_discount: bool) -> Res
         tokens_purchased: tokens_to_transfer 
     });
 
+    emit!(TokensFrozen {
+        investor: ctx.accounts.investor.key(),
+        unlock_time: lock_status.unlock_time,
+        is_accredited,
+    });
+
     Ok(())
 }
+
 
 pub fn unfreeze_investor_tokens(ctx: Context<UnfreezeTokens>) -> Result<()> {
     let lock_status = &ctx.accounts.lock_status;
@@ -477,6 +555,17 @@ pub fn unfreeze_investor_tokens(ctx: Context<UnfreezeTokens>) -> Result<()> {
 
     Ok(())
 }
+
+
+pub fn activate_token(ctx: Context<ManageToken>) -> Result<()> {
+    let token_config = &mut ctx.accounts.token_config;
+    require!(token_config.status == TokenStatus::Created, ErrorCode::InvalidTokenStatus);
+    
+    token_config.status = TokenStatus::Active;
+    msg!("Token activated: {}", token_config.symbol);
+    Ok(())
+}
+
    
 }
 
@@ -623,13 +712,13 @@ pub struct ManageSTO<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(amount: u64, is_using_discount: bool)]
+#[instruction(amount: u64, is_using_discount: bool, is_accredited: bool)]
 pub struct Invest<'info> {
     #[account(mut)]
     pub investor: Signer<'info>,
     
     #[account(mut)]
-    pub sto_config: Box<Account<'info, STOConfig>>, // Box the large account
+    pub sto_config: Box<Account<'info, STOConfig>>,
 
     #[account(mut)]
     pub token_config: Account<'info, TokenConfig>,
@@ -656,11 +745,22 @@ pub struct Invest<'info> {
     )]
     pub investor_token_account: Account<'info, TokenAccount>,
 
+    #[account(
+        init,
+        payer = investor,
+        space = InvestorLockStatus::LEN,
+        seeds = [b"lock_status", investor.key().as_ref(), token_mint.key().as_ref()],
+        bump
+    )]
+    pub lock_status: Account<'info, InvestorLockStatus>,
+
     pub token_mint: Account<'info, Mint>,
     pub usdc_mint: Account<'info, Mint>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 }
+
 
 #[derive(Accounts)]
 pub struct FreezeTokens<'info> {
@@ -727,56 +827,84 @@ pub struct UnfreezeTokens<'info> {
 }
 
 #[derive(Accounts)]
-pub struct InvestWithSol<'info> {
-   #[account(mut)]
-   pub investor: Signer<'info>,
-   
-   #[account(mut)]
-   pub sto_config: Box<Account<'info, STOConfig>>,
+pub struct ManageToken<'info> {
+    #[account(
+        mut,
+        constraint = token_config.authority == authority.key() @ ErrorCode::UnauthorizedAuthority
+    )]
+    pub authority: Signer<'info>,
 
-   #[account(mut)]
-   pub token_config: Account<'info, TokenConfig>,
+    #[account(
+        mut,
+        seeds = [b"token_config", token_mint.key().as_ref()],
+        bump = token_config.bump
+    )]
+    pub token_config: Account<'info, TokenConfig>,
 
-   #[account(
-       mut,
-       seeds = [b"sol_vault", sto_config.key().as_ref()],
-       bump
-   )]
-   /// CHECK: SOL vault PDA
-   pub sol_vault: AccountInfo<'info>,
-
-   #[account(
-       mut,
-       constraint = sto_treasury.mint == token_mint.key()
-   )]
-   pub sto_treasury: Account<'info, TokenAccount>,
-
-   #[account(
-       mut,
-       constraint = investor_token_account.owner == investor.key(),
-       constraint = investor_token_account.mint == token_mint.key()
-   )]
-   pub investor_token_account: Account<'info, TokenAccount>,
-
-   pub token_mint: Account<'info, Mint>,
-
-   /// CHECK: Pyth price feed
-   pub sol_price_feed: AccountInfo<'info>,
-   
-   pub token_program: Program<'info, Token>,
-   pub system_program: Program<'info, System>,
+    pub token_mint: Account<'info, Mint>,
 }
 
-#[account]
-#[derive(Copy)] 
+#[derive(Accounts)]
+#[instruction(amount: u64, is_accredited: bool)]
+pub struct InvestWithSol<'info> {
+    #[account(mut)]
+    pub investor: Signer<'info>,
+   
+    #[account(mut)]
+    pub sto_config: Box<Account<'info, STOConfig>>,
+
+    #[account(mut)]
+    pub token_config: Account<'info, TokenConfig>,
+
+    #[account(
+        mut,
+        seeds = [b"sol_vault", sto_config.key().as_ref()],
+        bump
+    )]
+    /// CHECK: SOL vault PDA
+    pub sol_vault: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        constraint = sto_treasury.mint == token_mint.key()
+    )]
+    pub sto_treasury: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = investor_token_account.owner == investor.key(),
+        constraint = investor_token_account.mint == token_mint.key()
+    )]
+    pub investor_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        init,
+        payer = investor,
+        space = InvestorLockStatus::LEN,
+        seeds = [b"lock_status", investor.key().as_ref(), token_mint.key().as_ref()],
+        bump
+    )]
+    pub lock_status: Account<'info, InvestorLockStatus>,
+
+    pub token_mint: Account<'info, Mint>,
+
+    /// CHECK: Pyth price feed
+    pub sol_price_feed: AccountInfo<'info>,
+   
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Copy, Clone)] 
 pub struct Tier {
-    pub rate: u64,                // Price in USDC
-    pub rate_discounted: u64,     // Discounted price (optional)
-    pub total_tokens: u64,        // Total tokens in tier
-    pub tokens_sold: u64,         // Tokens sold in tier
-    pub tokens_discounted: u64,   // Discount allocation
-    pub min_investment: u64,      // Min investment
-    pub max_investment: u64,      // Max investment
+    pub rate: u64,
+    pub rate_discounted: u64,
+    pub total_tokens: u64,
+    pub tokens_sold: u64,
+    pub tokens_discounted: u64,
+    pub min_investment: u64,
+    pub max_investment: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq)]

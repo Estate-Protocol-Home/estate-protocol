@@ -31,8 +31,8 @@ describe("estate_protocol", () => {
   });
 
   it("Creates a security token", async () => {
-    const tokenName = "Estate Token";
-    const tokenSymbol = "EST";
+    const tokenName = "Estate Token 200";
+    const tokenSymbol = "EP200";
     const tokenDetails = "https://example.com/token";
     const divisible = true;
     const treasuryWallet = provider.wallet.publicKey;
@@ -54,7 +54,7 @@ describe("estate_protocol", () => {
           metadata: await getMetadataAddress(mint.publicKey),
           tokenConfig,
           tokenProgram: TOKEN_PROGRAM_ID,
-          tokenMetadataProgram: METADATA_PROGRAM_ID, // Need to add constant
+          tokenMetadataProgram: METADATA_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
           rent: anchor.web3.SYSVAR_RENT_PUBKEY,
         })
@@ -75,6 +75,23 @@ describe("estate_protocol", () => {
       expect(tokenConfigAccount.treasuryWallet).to.eql(treasuryWallet);
       expect(tokenConfigAccount.status).to.eql({ created: {} });
       expect(tokenConfigAccount.bump).to.eq(configBump);
+
+      // Add token activation step
+      await program.methods
+        .activateToken()
+        .accounts({
+          authority: provider.wallet.publicKey,
+          tokenConfig,
+          tokenMint: mint.publicKey,
+        })
+        .rpc();
+
+      // Verify token is activated
+      const updatedTokenConfig = await (program.account as any).tokenConfig.fetch(tokenConfig);
+      expect(updatedTokenConfig.status).to.eql({ active: {} });
+
+      // Log the mint address for STO tests
+      console.log("Created and activated token with mint address:", mint.publicKey.toString());
 
     } catch (err) {
       console.log("Error: ", err);
